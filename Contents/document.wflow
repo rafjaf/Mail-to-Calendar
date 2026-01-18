@@ -1,0 +1,608 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>AMApplicationBuild</key>
+	<string>533</string>
+	<key>AMApplicationVersion</key>
+	<string>2.10</string>
+	<key>AMDocumentVersion</key>
+	<string>2</string>
+	<key>actions</key>
+	<array>
+		<dict>
+			<key>action</key>
+			<dict>
+				<key>AMAccepts</key>
+				<dict>
+					<key>Container</key>
+					<string>List</string>
+					<key>Optional</key>
+					<true/>
+					<key>Types</key>
+					<array>
+						<string>com.apple.applescript.object</string>
+					</array>
+				</dict>
+				<key>AMActionVersion</key>
+				<string>1.0</string>
+				<key>AMApplication</key>
+				<array>
+					<string>Automator</string>
+				</array>
+				<key>AMParameterProperties</key>
+				<dict>
+					<key>source</key>
+					<dict/>
+				</dict>
+				<key>AMProvides</key>
+				<dict>
+					<key>Container</key>
+					<string>List</string>
+					<key>Types</key>
+					<array>
+						<string>com.apple.applescript.object</string>
+					</array>
+				</dict>
+				<key>ActionBundlePath</key>
+				<string>/System/Library/Automator/Run JavaScript.action</string>
+				<key>ActionName</key>
+				<string>Exécuter JavaScript</string>
+				<key>ActionParameters</key>
+				<dict>
+					<key>source</key>
+					<string>/*
+Mail → LLM → Calendar (JXA)
+
+Select an email in Apple Mail, run this.
+Provider: "ollama" or "openai"
+*/
+
+ObjC.import("stdlib");
+ObjC.import("Foundation");
+
+const CONFIG = {
+  provider: "ollama", // "ollama" or "openai"
+  timezone: ObjC.unwrap($.NSTimeZone.systemTimeZone.name) || "Europe/Brussels",
+  defaultDurationMinutes: 60,
+ 
+  // Ollama
+  ollamaUrl: "http://localhost:11434/api/chat",
+  ollamaModel: "gpt-oss:latest",
+
+  // OpenAI
+  openaiUrl: "https://api.openai.com/v1/chat/completions",
+  openaiModel: "gpt-5-mini",
+  openaiApiKey: "", // leave blank to read from Keychain (recommended)
+	openaiKeychainService: "openai-API-token",
+	openaiKeychainAccount: ObjC.unwrap($.NSProcessInfo.processInfo.environment.objectForKey('USER')) || "default",
+};
+
+function run() {
+	const app = Application.currentApplication();
+	app.includeStandardAdditions = true;
+
+	const logPath = defaultLogPath();
+	app.displayNotification("Processing most recent email of the thread…", { withTitle: "Mail to Calendar" });
+
+	let mailText = "";
+	let prompt = "";
+	let llmJsonText = "";
+
+	try {
+		mailText = getSelectedMailText();
+		prompt = buildPrompt(mailText);
+
+		let providerUsed = CONFIG.provider;
+		let eventsToCreate = [];
+
+		while (true) {
+			llmJsonText = (providerUsed === "ollama")
+				? callOllama(prompt)
+				: callOpenAI(prompt);
+
+			eventsToCreate = parseEventsFromLlm(llmJsonText, app);
+			if (eventsToCreate.length === 0) {
+				throw new Error("No valid events detected (missing title or start). See log for LLM output.");
+			}
+
+			const action = createIcsAndHandle(eventsToCreate, providerUsed === "ollama");
+			if (action === "retry-openai") {
+				providerUsed = "openai";
+				continue;
+			}
+			if (action === "cancel") {
+				return;
+			}
+			break;
+		}
+
+		const summary = (eventsToCreate.length === 1)
+			? `Draft prepared: ${eventsToCreate[0].title}`
+			: `Draft prepared: ${eventsToCreate.length} events`;
+		app.displayNotification(summary, { withTitle: "Mail to Calendar" });
+	} catch (e) {
+		logToFile(logPath, buildLogPayload({ error: e, mailText, prompt, llmJsonText }));
+		app.displayNotification("Failed. See log: " + logPath, { withTitle: "Mail to Calendar" });
+		throw e;
+	}
+}
+
+function getSelectedMailText() {
+	const m = getFocusedMessage();
+	if (!m) throw new Error("No message selected in Mail.");
+  const subject = m.subject() || "";
+  const sender = m.sender() || "";
+  const received = String(m.dateReceived() || "");
+  let body = "";
+  try { body = m.content() || ""; } catch (e) { body = ""; }
+
+  return `From: ${sender}\nSubject: ${subject}\nReceived: ${received}\n\n${body}`;
+}
+
+function getFocusedMessage() {
+	const Mail = Application("Mail");
+	let msgs = [];
+
+	try {
+		const viewers = Mail.messageViewers();
+		if (viewers &amp;&amp; viewers.length > 0) {
+			const selected = viewers[0].selectedMessages();
+			if (selected &amp;&amp; selected.length > 0) msgs = selected;
+		}
+	} catch (e) {}
+
+	if (!msgs || msgs.length === 0) {
+		try {
+			const sel = Mail.selection();
+			if (sel &amp;&amp; sel.length > 0) msgs = sel;
+		} catch (e) {}
+	}
+
+	if (!msgs || msgs.length === 0) return null;
+
+	const sorted = Array.from(msgs).sort((a, b) => {
+		const da = new Date(a.dateReceived() || 0).getTime();
+		const db = new Date(b.dateReceived() || 0).getTime();
+		return db - da;
+	});
+
+	return sorted[0] || null;
+}
+
+function buildPrompt(mailText) {
+  return [
+    "Extract a calendar event from the email below.",
+    "Return ONLY valid JSON (no markdown) with keys:",
+    "title, start, end, timezone, location, notes, attendees, confidence",
+    "Rules:",
+    `- start/end must be ISO 8601 (e.g. 2026-01-18T14:00:00+01:00)`,
+    "- If end is unknown, omit it (I'll default duration).",
+    `- If timezone unknown, set timezone="${CONFIG.timezone}" and use it in start/end offsets.`,
+    '- If no event can be inferred, set confidence=0 and title="".',
+    "- notes should include useful context (speaker, agenda, link, address).",
+    "",
+    "EMAIL:",
+    mailText,
+  ].join("\n");
+}
+
+function callOllama(promptText) {
+  const payload = {
+    model: CONFIG.ollamaModel,
+    stream: false,
+    messages: [
+      { role: "system", content: "You extract calendar events from emails and output ONLY JSON." },
+      { role: "user", content: promptText },
+    ],
+  };
+  const resp = httpPostJson(CONFIG.ollamaUrl, payload, {});
+  // { message: { content: "..." }, ... }
+  return (resp &amp;&amp; resp.message &amp;&amp; resp.message.content) ? String(resp.message.content) : "";
+}
+
+function callOpenAI(promptText) {
+  const apiKey = CONFIG.openaiApiKey || readKeychain(CONFIG.openaiKeychainService, CONFIG.openaiKeychainAccount);
+  if (!apiKey) throw new Error("OpenAI API key missing (set CONFIG.openaiApiKey or store in Keychain as openai-API-token).");
+
+  const payload = {
+    model: CONFIG.openaiModel,
+    messages: [
+      { role: "system", content: "You extract calendar events from emails and output ONLY JSON." },
+      { role: "user", content: promptText },
+    ],
+    temperature: 1,
+  };
+
+  const resp = httpPostJson(CONFIG.openaiUrl, payload, { Authorization: `Bearer ${apiKey}` });
+	const content = resp?.choices?.[0]?.message?.content;
+	  if (!content) {
+	    if (resp &amp;&amp; resp.error) {
+			throw new Error("OpenAI API error: " + JSON.stringify(resp.error));
+		}
+		throw new Error("OpenAI returned empty content. Response: " + JSON.stringify(resp));
+	}
+	return String(content);
+}
+
+function httpPostJson(url, payloadObj, extraHeaders) {
+  const app = Application.currentApplication();
+  app.includeStandardAdditions = true;
+
+  const payloadStr = JSON.stringify(payloadObj);
+
+  const headerArgs = Object.entries(extraHeaders || {}).flatMap(([k, v]) =&gt; ["-H", `${k}: ${v}`]);
+
+  const cmd = [
+    "/usr/bin/curl", "-s",
+    "-H", "Content-Type: application/json",
+    ...headerArgs,
+    "-d", payloadStr,
+    url,
+  ];
+
+  const out = app.doShellScript(cmd.map(shellEscape).join(" "));
+  try { return JSON.parse(out); } catch (e) { throw new Error("Non-JSON HTTP response:\n" + out); }
+}
+
+function readKeychain(service, account) {
+  const app = Application.currentApplication();
+  app.includeStandardAdditions = true;
+  try {
+    const cmd = `security find-generic-password -s ${shellEscape(service)} -a ${shellEscape(account)} -w`;
+    return app.doShellScript(cmd).trim();
+  } catch (e) {
+    return "";
+  }
+}
+
+function isoPlusMinutes(isoStr, mins) {
+  const d = new Date(isoStr);
+  if (isNaN(d.getTime())) throw new Error("Invalid ISO date: " + isoStr);
+  return new Date(d.getTime() + mins * 60000).toISOString();
+}
+
+function parseEventsFromLlm(llmJsonText, app) {
+	if (!llmJsonText || !llmJsonText.trim()) throw new Error("LLM returned empty response.");
+
+	let evt;
+	try {
+		evt = JSON.parse(llmJsonText);
+	} catch (e) {
+		throw new Error("LLM did not return valid JSON. Response was:\n" + llmJsonText);
+	}
+
+	const events = Array.isArray(evt) ? evt : [evt];
+	const eventsToCreate = [];
+
+	for (const item of events) {
+		const title = (item?.title || "").trim();
+		const start = (item?.start || "").trim();
+		let end = (item?.end || "").trim();
+		const location = (item?.location || "").trim();
+		const notes = (item?.notes || "").trim();
+		const confidence = (typeof item?.confidence === "number") ? item.confidence : null;
+
+		if (!title || !start) continue;
+
+		if (!end) end = isoPlusMinutes(start, CONFIG.defaultDurationMinutes);
+
+		if (confidence !== null &amp;&amp; confidence &lt; 0.5) {
+			const r = app.displayDialog(`Low confidence (${confidence}). Create event anyway?`, {
+				buttons: ["Cancel", "Create"],
+				defaultButton: "Cancel",
+			});
+			if (r.buttonReturned === "Cancel") continue;
+		}
+
+		eventsToCreate.push({
+			title,
+			startISO: start,
+			endISO: end,
+			location,
+			notes,
+		});
+	}
+
+	return eventsToCreate;
+}
+
+function createIcsAndHandle(events, allowRetry) {
+	const app = Application.currentApplication();
+	app.includeStandardAdditions = true;
+
+	const icsContent = buildIcs(events);
+	const path = tempIcsPath();
+
+	app.doShellScript(`printf %s ${shellEscape(icsContent)} > ${shellEscape(path)}`);
+
+	const preview = buildHumanPreview(events);
+	const choice = safeDisplayDialog(preview, {
+		withTitle: "Mail to Calendar",
+		buttons: ["Cancel", "Edit", "OK"],
+		defaultButton: "OK",
+		cancelButton: "Cancel",
+	});
+	if (!choice) {
+		if (allowRetry) {
+			const retryChoice = safeDisplayDialog("Retry analysis with ChatGPT?", {
+				withTitle: "Mail to Calendar",
+				buttons: ["Cancel", "Retry with ChatGPT"],
+				defaultButton: "Retry with ChatGPT",
+				cancelButton: "Cancel",
+			});
+			if (retryChoice &amp;&amp; retryChoice.buttonReturned === "Retry with ChatGPT") {
+				app.doShellScript(`/bin/rm -f ${shellEscape(path)}`);
+				return "retry-openai";
+			}
+		}
+		return "cancel";
+	}
+
+	if (choice.buttonReturned === "Edit") {
+		const before = getFileMtime(path);
+		app.doShellScript(`/usr/bin/open -t ${shellEscape(path)}`);
+		const changed = waitForFileChange(path, before, 600);
+		if (changed) app.doShellScript(`/usr/bin/open -a Calendar ${shellEscape(path)}`);
+	} else if (choice.buttonReturned === "OK") {
+		app.doShellScript(`/usr/bin/open -a Calendar ${shellEscape(path)}`);
+	}
+
+	return path;
+}
+
+function safeDisplayDialog(text, options) {
+	const app = Application.currentApplication();
+	app.includeStandardAdditions = true;
+	try {
+		return app.displayDialog(text, options);
+	} catch (e) {
+		return null;
+	}
+}
+
+function buildHumanPreview(events) {
+	const parts = ["Draft calendar event(s):", ""];
+	for (const ev of events) {
+		const start = new Date(ev.startISO);
+		const end = new Date(ev.endISO);
+		const startStr = isNaN(start.getTime()) ? ev.startISO : start.toLocaleString();
+		const endStr = isNaN(end.getTime()) ? ev.endISO : end.toLocaleString();
+		parts.push(`• ${ev.title}`);
+		parts.push(`  When: ${startStr} → ${endStr}`);
+		if (ev.location) parts.push(`  Where: ${ev.location}`);
+		if (ev.notes) parts.push(`  Notes: ${truncatePreview(ev.notes)}`);
+		parts.push("");
+	}
+	parts.push("Choose OK to open in Calendar, Edit to open the .ics file, or Cancel.");
+	return parts.join("\n");
+}
+
+function truncatePreview(text) {
+	const s = String(text).replace(/\s+/g, " ").trim();
+	return s.length > 200 ? s.slice(0, 200) + "…" : s;
+}
+
+function getFileMtime(path) {
+	const app = Application.currentApplication();
+	app.includeStandardAdditions = true;
+	try {
+		const out = app.doShellScript(`/usr/bin/stat -f %m ${shellEscape(path)}`);
+		return parseInt(out, 10) || 0;
+	} catch (e) {
+		return 0;
+	}
+}
+
+function waitForFileChange(path, previousMtime, timeoutSeconds) {
+	const app = Application.currentApplication();
+	app.includeStandardAdditions = true;
+	const start = Date.now();
+	while ((Date.now() - start) / 1000 &lt; timeoutSeconds) {
+		app.doShellScript("/bin/sleep 1");
+		const mtime = getFileMtime(path);
+		if (mtime > previousMtime) return true;
+	}
+	return false;
+}
+
+function buildIcs(events) {
+	const lines = [
+		"BEGIN:VCALENDAR",
+		"VERSION:2.0",
+		"PRODID:-//MailToCalendar//EN",
+		"CALSCALE:GREGORIAN",
+	];
+
+	const dtstamp = formatIcsDate(new Date());
+
+	for (const ev of events) {
+		const start = new Date(ev.startISO);
+		const end = new Date(ev.endISO);
+		if (isNaN(start.getTime())) throw new Error("Invalid start date: " + ev.startISO);
+		if (isNaN(end.getTime())) throw new Error("Invalid end date: " + ev.endISO);
+
+		lines.push("BEGIN:VEVENT");
+		lines.push("UID:" + generateUid());
+		lines.push("DTSTAMP:" + dtstamp);
+		lines.push("DTSTART:" + formatIcsDate(start));
+		lines.push("DTEND:" + formatIcsDate(end));
+		lines.push("SUMMARY:" + escapeIcsText(ev.title));
+		if (ev.location) lines.push("LOCATION:" + escapeIcsText(ev.location));
+		if (ev.notes) lines.push("DESCRIPTION:" + escapeIcsText(ev.notes));
+		lines.push("END:VEVENT");
+	}
+
+	lines.push("END:VCALENDAR");
+	return lines.join("\r\n") + "\r\n";
+}
+
+function formatIcsDate(date) {
+	const y = date.getUTCFullYear();
+	const m = String(date.getUTCMonth() + 1).padStart(2, "0");
+	const d = String(date.getUTCDate()).padStart(2, "0");
+	const hh = String(date.getUTCHours()).padStart(2, "0");
+	const mm = String(date.getUTCMinutes()).padStart(2, "0");
+	const ss = String(date.getUTCSeconds()).padStart(2, "0");
+	return `${y}${m}${d}T${hh}${mm}${ss}Z`;
+}
+
+function escapeIcsText(text) {
+	return String(text)
+		.replace(/\\/g, "\\\\")
+		.replace(/\n/g, "\\n")
+		.replace(/\r/g, "")
+		.replace(/;/g, "\\;")
+		.replace(/,/g, "\\,");
+}
+
+function generateUid() {
+	const rand = Math.random().toString(36).slice(2, 10);
+	return `${Date.now()}-${rand}@mail-to-calendar`;
+}
+
+function tempIcsPath() {
+	const tmp = ObjC.unwrap($.NSTemporaryDirectory());
+	return tmp.replace(/\/$/, "") + `/MailToCalendar-${Date.now()}.ics`;
+}
+
+function shellEscape(s) {
+  // minimal safe single-quote escape for shell
+  const str = String(s);
+  return "'" + str.replace(/'/g, "'\\''") + "'";
+}
+
+function defaultLogPath() {
+	const home = ObjC.unwrap($.NSHomeDirectory());
+	return home + "/Library/Logs/MailToCalendar.log";
+}
+
+function buildLogPayload({ error, mailText, prompt, llmJsonText }) {
+	const errText = (error &amp;&amp; error.stack) ? String(error.stack) : String(error);
+	return JSON.stringify({
+		error: errText,
+		mailText: mailText || "",
+		prompt: prompt || "",
+		llmJsonText: llmJsonText || "",
+	}, null, 2);
+}
+
+function logToFile(path, text) {
+	const app = Application.currentApplication();
+	app.includeStandardAdditions = true;
+
+	const dir = path.replace(/\/[^\/]+$/, "");
+	app.doShellScript(`/bin/mkdir -p ${shellEscape(dir)}`);
+
+	const payload = `\n[${new Date().toISOString()}]\n${text}\n`;
+	app.doShellScript(`printf %s ${shellEscape(payload)} &gt;&gt; ${shellEscape(path)}`);
+}
+</string>
+				</dict>
+				<key>BundleIdentifier</key>
+				<string>com.apple.Automator.RunJavaScript</string>
+				<key>CFBundleVersion</key>
+				<string>1.0</string>
+				<key>CanShowSelectedItemsWhenRun</key>
+				<false/>
+				<key>CanShowWhenRun</key>
+				<true/>
+				<key>Category</key>
+				<array>
+					<string>AMCategoryUtilities</string>
+				</array>
+				<key>Class Name</key>
+				<string>RunJavaScriptAction</string>
+				<key>InputUUID</key>
+				<string>1324986F-E687-470C-96F6-399A74C60CC4</string>
+				<key>Keywords</key>
+				<array>
+					<string>Exécuter</string>
+					<string>JavaScript</string>
+				</array>
+				<key>OutputUUID</key>
+				<string>D6BC9B00-5945-4578-98AA-2DB3069B42B5</string>
+				<key>UUID</key>
+				<string>F2148360-55DB-447C-83C4-B07F89C3B8E2</string>
+				<key>UnlocalizedApplications</key>
+				<array>
+					<string>Automator</string>
+				</array>
+				<key>arguments</key>
+				<dict>
+					<key>0</key>
+					<dict>
+						<key>default value</key>
+						<string>function run(input, parameters) {
+	
+	// Your script goes here
+
+	return input;
+}</string>
+						<key>name</key>
+						<string>source</string>
+						<key>required</key>
+						<string>0</string>
+						<key>type</key>
+						<string>0</string>
+						<key>uuid</key>
+						<string>0</string>
+					</dict>
+				</dict>
+				<key>conversionLabel</key>
+				<integer>0</integer>
+				<key>isViewVisible</key>
+				<integer>1</integer>
+				<key>location</key>
+				<string>309.000000:368.000000</string>
+				<key>nibPath</key>
+				<string>/System/Library/Automator/Run JavaScript.action/Contents/Resources/Base.lproj/main.nib</string>
+			</dict>
+			<key>isViewVisible</key>
+			<integer>1</integer>
+		</dict>
+	</array>
+	<key>connectors</key>
+	<dict/>
+	<key>workflowMetaData</key>
+	<dict>
+		<key>applicationBundleID</key>
+		<string>com.apple.mail</string>
+		<key>applicationBundleIDsByPath</key>
+		<dict>
+			<key>/System/Applications/Mail.app</key>
+			<string>com.apple.mail</string>
+		</dict>
+		<key>applicationPath</key>
+		<string>/System/Applications/Mail.app</string>
+		<key>applicationPaths</key>
+		<array>
+			<string>/System/Applications/Mail.app</string>
+		</array>
+		<key>inputTypeIdentifier</key>
+		<string>com.apple.Automator.nothing</string>
+		<key>outputTypeIdentifier</key>
+		<string>com.apple.Automator.nothing</string>
+		<key>presentationMode</key>
+		<integer>11</integer>
+		<key>processesInput</key>
+		<false/>
+		<key>serviceApplicationBundleID</key>
+		<string>com.apple.mail</string>
+		<key>serviceApplicationPath</key>
+		<string>/System/Applications/Mail.app</string>
+		<key>serviceInputTypeIdentifier</key>
+		<string>com.apple.Automator.nothing</string>
+		<key>serviceOutputTypeIdentifier</key>
+		<string>com.apple.Automator.nothing</string>
+		<key>serviceProcessesInput</key>
+		<false/>
+		<key>systemImageName</key>
+		<string>NSActionTemplate</string>
+		<key>useAutomaticInputType</key>
+		<false/>
+		<key>workflowTypeIdentifier</key>
+		<string>com.apple.Automator.servicesMenu</string>
+	</dict>
+</dict>
+</plist>
