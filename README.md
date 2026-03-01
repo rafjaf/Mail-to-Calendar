@@ -26,13 +26,14 @@ This Automator service extracts calendar events from the most recent email of th
 3. (Optional) Configure the provider and other settings
    - Open the workflow in Automator or `Contents/document.wflow` in a text editor, and edit the JavaScript action (the `document.wflow` Run JavaScript source).
    - In `CONFIG` you can change:
-     - `provider`: `"ollama"` or `"openai"`
+     - `provider`: **"mlx"** (default), or set to "ollama" or "openai" if you prefer a different backend. The workflow now assumes a local MLX-compatible model server by default.
      - `defaultDurationMinutes`: fallback duration when `end` is missing
      - `calendarName`: default calendar name (used only in older flows; the current .ics flow lets you choose)
-     - `ollamaUrl` / `ollamaModel` : by default gpt-oss:latest
-     - `openaiModel` : by default gpt-5-mini
+     - `ollamaUrl` / `ollamaModel`: endpoint/model when provider is "ollama" (default gpt-oss:latest)
+     - `mlxUrl` / `mlxModel`: endpoint/model for MLX (e.g. `http://localhost:11434/v1/chat/completions` and your model name)
+     - `openaiModel`: model when provider is "openai" (default gpt-5-mini)
      - `openaiApiKey`: set directly (string) or leave empty to read from Keychain
-     - `openaiKeychainService` / `openaiKeychainAccount` if you want a different Keychain entry
+     - `openaiKeychainService` / `openaiKeychainAccount`: if you want a different Keychain entry
 4. (If using OpenAI) Store your API key in Keychain (recommended)
 
    Example (Terminal):

@@ -62,13 +62,17 @@ ObjC.import("stdlib");
 ObjC.import("Foundation");
 
 const CONFIG = {
-  provider: "ollama", // "ollama" or "openai"
+  provider: "mlx", // "mlx", "ollama", or "openai"
   timezone: ObjC.unwrap($.NSTimeZone.systemTimeZone.name) || "Europe/Brussels",
   defaultDurationMinutes: 60,
- 
-  // Ollama
+
+  // Ollama (native /api/chat format)
   ollamaUrl: "http://localhost:11434/api/chat",
   ollamaModel: "gpt-oss:latest",
+
+  // MLX LM Server (OpenAI-compatible API, e.g. mlx_lm.server --port 11434)
+  mlxUrl: "http://localhost:11434/v1/chat/completions",
+  mlxModel: "mlx-community/Mistral-7B-Instruct-v0.3-4bit", // ← change to your loaded model name
 
   // OpenAI
   openaiUrl: "https://api.openai.com/v1/chat/completions",
@@ -93,12 +97,14 @@ function run() {
 		mailText = getSelectedMailText();
 		prompt = buildPrompt(mailText);
 
-		let providerUsed = CONFIG.provider;
+		let providerUsed = CONFIG.provider; // set via CONFIG.provider: "mlx", "ollama", or "openai"
 		let eventsToCreate = [];
 
 		while (true) {
 			llmJsonText = (providerUsed === "ollama")
 				? callOllama(prompt)
+				: (providerUsed === "mlx")
+				? callMLX(prompt)
 				: callOpenAI(prompt);
 
 			eventsToCreate = parseEventsFromLlm(llmJsonText, app);
@@ -106,7 +112,7 @@ function run() {
 				throw new Error("No valid events detected (missing title or start). See log for LLM output.");
 			}
 
-			const action = createIcsAndHandle(eventsToCreate, providerUsed === "ollama");
+			const action = createIcsAndHandle(eventsToCreate, providerUsed === "ollama" || providerUsed === "mlx");
 			if (action === "retry-openai") {
 				providerUsed = "openai";
 				continue;
@@ -201,6 +207,27 @@ function callOllama(promptText) {
   return (resp &amp;&amp; resp.message &amp;&amp; resp.message.content) ? String(resp.message.content) : "";
 }
 
+function callMLX(promptText) {
+  // mlx_lm.server exposes an OpenAI-compatible API at /v1/chat/completions.
+  // It does NOT accept a leading "system" role — roles must alternate user/assistant.
+  // We prepend the system instruction directly into the user message instead.
+  const systemInstruction = "You extract calendar events from emails and output ONLY JSON. No markdown, no explanation.";
+  const payload = {
+    model: CONFIG.mlxModel,
+    messages: [
+      { role: "user", content: systemInstruction + "\n\n" + promptText },
+    ],
+    temperature: 0.1,
+  };
+  const resp = httpPostJson(CONFIG.mlxUrl, payload, {});
+  const content = resp &amp;&amp; resp.choices &amp;&amp; resp.choices[0] &amp;&amp; resp.choices[0].message &amp;&amp; resp.choices[0].message.content;
+  if (!content) {
+    if (resp &amp;&amp; resp.error) throw new Error("MLX API error: " + JSON.stringify(resp.error));
+    throw new Error("MLX returned empty content. Full response logged to: " + defaultLogPath());
+  }
+  return String(content);
+}
+
 function callOpenAI(promptText) {
   const apiKey = CONFIG.openaiApiKey || readKeychain(CONFIG.openaiKeychainService, CONFIG.openaiKeychainAccount);
   if (!apiKey) throw new Error("OpenAI API key missing (set CONFIG.openaiApiKey or store in Keychain as openai-API-token).");
@@ -242,6 +269,17 @@ function httpPostJson(url, payloadObj, extraHeaders) {
   ];
 
   const out = app.doShellScript(cmd.map(shellEscape).join(" "));
+
+  // Debug: always log the raw HTTP response so we can inspect what the server returns
+  try {
+    const _dbgPath = defaultLogPath();
+    logToFile(_dbgPath, JSON.stringify({
+      debug_url: url,
+      debug_status: out.slice(0, 120),
+      debug_raw_response: out.slice(0, 8000),
+    }, null, 2));
+  } catch (_dbgErr) {}
+
   try { return JSON.parse(out); } catch (e) { throw new Error("Non-JSON HTTP response:\n" + out); }
 }
 
