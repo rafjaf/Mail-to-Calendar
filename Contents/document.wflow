@@ -71,8 +71,8 @@ const CONFIG = {
   ollamaModel: "gpt-oss:latest",
 
   // MLX LM Server (OpenAI-compatible API, e.g. mlx_lm.server --port 11434)
-  mlxUrl: "http://localhost:11434/v1/chat/completions",
-  mlxModel: "mlx-community/Mistral-7B-Instruct-v0.3-4bit", // ← change to your loaded model name
+  mlxUrl: "http://localhost:32000/v1/chat/completions",
+  mlxModel: "mlx-community/gpt-oss-20b-MXFP4-Q8", // ← change to your loaded model name
 
   // OpenAI
   openaiUrl: "https://api.openai.com/v1/chat/completions",
@@ -95,7 +95,8 @@ function run() {
 
 	try {
 		mailText = getSelectedMailText();
-		prompt = buildPrompt(mailText);
+		const promptMailText = prepareMailTextForPrompt(mailText);
+		prompt = buildPrompt(promptMailText);
 
 		let providerUsed = CONFIG.provider; // set via CONFIG.provider: "mlx", "ollama", or "openai"
 		let eventsToCreate = [];
@@ -107,7 +108,16 @@ function run() {
 				? callMLX(prompt)
 				: callOpenAI(prompt);
 
-			eventsToCreate = parseEventsFromLlm(llmJsonText, app);
+			try {
+				eventsToCreate = parseEventsFromLlm(llmJsonText, app);
+			} catch (parseError) {
+				eventsToCreate = extractEventsFromMailHeuristics(mailText, app);
+				if (eventsToCreate.length === 0 &amp;&amp; shouldRetryParseFailureWithOpenAI(providerUsed, parseError)) {
+					providerUsed = "openai";
+					continue;
+				}
+				if (eventsToCreate.length === 0) throw parseError;
+			}
 			if (eventsToCreate.length === 0) {
 				throw new Error("No valid events detected (missing title or start). See log for LLM output.");
 			}
@@ -134,6 +144,23 @@ function run() {
 	}
 }
 
+function shouldRetryParseFailureWithOpenAI(providerUsed, error) {
+	if (providerUsed !== "ollama" &amp;&amp; providerUsed !== "mlx") return false;
+
+	const message = truncatePreview(String(error || "Unknown parsing error."));
+	const retryChoice = safeDisplayDialog(
+		"The local model returned invalid calendar data.\n\n" + message + "\n\nRetry analysis with ChatGPT?",
+		{
+			withTitle: "Mail to Calendar",
+			buttons: ["Cancel", "Retry with ChatGPT"],
+			defaultButton: "Retry with ChatGPT",
+			cancelButton: "Cancel",
+		}
+	);
+
+	return !!(retryChoice &amp;&amp; retryChoice.buttonReturned === "Retry with ChatGPT");
+}
+
 function getSelectedMailText() {
 	const m = getFocusedMessage();
 	if (!m) throw new Error("No message selected in Mail.");
@@ -144,6 +171,57 @@ function getSelectedMailText() {
   try { body = m.content() || ""; } catch (e) { body = ""; }
 
   return `From: ${sender}\nSubject: ${subject}\nReceived: ${received}\n\n${body}`;
+}
+
+function prepareMailTextForPrompt(mailText) {
+	const text = String(mailText || "");
+	const lines = text.split(/\r?\n/);
+	const filtered = [];
+	let blankRun = 0;
+
+	for (const rawLine of lines) {
+		const line = sanitizeMailLine(rawLine);
+		if (shouldSkipPromptLine(line)) continue;
+
+		if (!line) {
+			blankRun++;
+			if (blankRun > 1) continue;
+			filtered.push("");
+			continue;
+		}
+
+		blankRun = 0;
+		filtered.push(line);
+	}
+
+	const joined = filtered.join("\n").trim();
+	if (joined.length &lt;= 5000) return joined;
+	return joined.slice(0, 5000);
+}
+
+function sanitizeMailLine(line) {
+	return String(line || "")
+		.replace(/[\uFFFC\u00A0]/g, " ")
+		.replace(/\s+/g, " ")
+		.trim();
+}
+
+function shouldSkipPromptLine(line) {
+	if (!line) return false;
+	const lower = line.toLowerCase();
+	return (
+		lower === "internal" ||
+		lower === "support" ||
+		lower === "mijn boekingen" ||
+		lower.includes("dit is een niet-beantwoordbare e-mail") ||
+		lower.includes("privacybeleid") ||
+		lower.includes("reisvoorwaarden") ||
+		lower.includes("insolventiegarantie") ||
+		lower.includes("rechten die van toepassing zijn op pakketten") ||
+		lower.includes("geen interesse?") ||
+		lower.includes("alle rechten voorbehouden") ||
+		lower.startsWith("gotogate / ")
+	);
 }
 
 function getFocusedMessage() {
@@ -178,14 +256,18 @@ function getFocusedMessage() {
 
 function buildPrompt(mailText) {
   return [
-    "Extract a calendar event from the email below.",
-    "Return ONLY valid JSON (no markdown) with keys:",
-    "title, start, end, timezone, location, notes, attendees, confidence",
+		"Extract one or more calendar events from the email below.",
+		"Return ONLY valid JSON. No markdown, no prose, no analysis.",
+		"If there is exactly one event, return a single JSON object.",
+		"If there are multiple separate events, return a JSON array of objects.",
+		"Each object must use exactly these keys:",
+		"title, start, end, timezone, location, notes, attendees, confidence",
     "Rules:",
     `- start/end must be ISO 8601 (e.g. 2026-01-18T14:00:00+01:00)`,
     "- If end is unknown, omit it (I'll default duration).",
     `- If timezone unknown, set timezone="${CONFIG.timezone}" and use it in start/end offsets.`,
     '- If no event can be inferred, set confidence=0 and title="".',
+		'- attendees must be an array of strings only.',
     "- notes should include useful context (speaker, agenda, link, address).",
     "",
     "EMAIL:",
@@ -217,7 +299,9 @@ function callMLX(promptText) {
     messages: [
       { role: "user", content: systemInstruction + "\n\n" + promptText },
     ],
+		stream: false,
     temperature: 0.1,
+		max_tokens: 1000,
   };
   const resp = httpPostJson(CONFIG.mlxUrl, payload, {});
   const content = resp &amp;&amp; resp.choices &amp;&amp; resp.choices[0] &amp;&amp; resp.choices[0].message &amp;&amp; resp.choices[0].message.content;
@@ -238,7 +322,9 @@ function callOpenAI(promptText) {
       { role: "system", content: "You extract calendar events from emails and output ONLY JSON." },
       { role: "user", content: promptText },
     ],
+		stream: false,
     temperature: 1,
+		max_completion_tokens: 1500,
   };
 
   const resp = httpPostJson(CONFIG.openaiUrl, payload, { Authorization: `Bearer ${apiKey}` });
@@ -303,11 +389,13 @@ function isoPlusMinutes(isoStr, mins) {
 function parseEventsFromLlm(llmJsonText, app) {
 	if (!llmJsonText || !llmJsonText.trim()) throw new Error("LLM returned empty response.");
 
+	const jsonText = extractJsonPayload(llmJsonText);
+
 	let evt;
 	try {
-		evt = JSON.parse(llmJsonText);
+		evt = JSON.parse(jsonText);
 	} catch (e) {
-		throw new Error("LLM did not return valid JSON. Response was:\n" + llmJsonText);
+		throw new Error("LLM did not return valid JSON. Extracted payload was:\n" + jsonText + "\n\nRaw response was:\n" + llmJsonText);
 	}
 
 	const events = Array.isArray(evt) ? evt : [evt];
@@ -343,6 +431,248 @@ function parseEventsFromLlm(llmJsonText, app) {
 	}
 
 	return eventsToCreate;
+}
+
+function extractEventsFromMailHeuristics(mailText, app) {
+	const segments = extractFlightSegments(mailText);
+	if (segments.length === 0) return [];
+
+	const events = [];
+	for (const segment of segments) {
+		if (!segment.startISO || !segment.endISO) continue;
+		events.push({
+			title: `Flight ${segment.fromCity} to ${segment.toCity}`,
+			startISO: segment.startISO,
+			endISO: segment.endISO,
+			location: `${segment.fromLabel} -> ${segment.toLabel}`,
+			notes: buildFlightNotes(mailText, segment),
+		});
+	}
+
+	if (events.length > 0) {
+		app.displayNotification("Used itinerary fallback for this email.", { withTitle: "Mail to Calendar" });
+	}
+
+	return events;
+}
+
+function extractFlightSegments(mailText) {
+	const normalized = normalizeMailText(mailText);
+	const lines = normalized.split(/\r?\n/).map(line => line.trim()).filter(Boolean);
+	const segments = [];
+	const passengers = extractPassengerNames(lines);
+	const bookingRef = extractBookingReference(normalized);
+
+	for (let i = 0; i &lt; lines.length; i++) {
+		if (!/^Vertrek\s*[•\-]/i.test(lines[i])) continue;
+
+		const dateInfo = parseDutchFlightDate(lines[i]);
+		if (!dateInfo) continue;
+
+		const departureTime = lines[i + 1] || "";
+		const arrivalTime = lines[i + 2] || "";
+		const fromLine = lines[i + 4] || "";
+		const toLine = lines[i + 5] || "";
+
+		if (!/^\d{1,2}:\d{2}$/.test(departureTime) || !/^\d{1,2}:\d{2}$/.test(arrivalTime)) continue;
+		if (!/[A-Z]{3}/.test(fromLine) || !/[A-Z]{3}/.test(toLine)) continue;
+
+		segments.push({
+			fromLabel: fromLine,
+			toLabel: toLine,
+			fromCity: stripAirportCode(fromLine),
+			toCity: stripAirportCode(toLine),
+			startISO: buildIsoFromLocal(dateInfo, departureTime),
+			endISO: buildIsoFromLocal(dateInfo, arrivalTime),
+			passengers,
+			bookingRef,
+		});
+	}
+
+	return segments;
+}
+
+function normalizeMailText(text) {
+	return String(text || "")
+		.replace(/\uFFFC/g, "\n")
+		.replace(/\u00A0/g, " ");
+}
+
+function parseDutchFlightDate(line) {
+	const match = line.match(/(\d{1,2})\s+(januari|februari|maart|april|mei|juni|juli|augustus|september|oktober|november|december),\s*(\d{4})/i);
+	if (!match) return null;
+	const monthMap = {
+		januari: 1,
+		februari: 2,
+		maart: 3,
+		april: 4,
+		mei: 5,
+		juni: 6,
+		juli: 7,
+		augustus: 8,
+		september: 9,
+		oktober: 10,
+		november: 11,
+		december: 12,
+	};
+	return {
+		day: parseInt(match[1], 10),
+		month: monthMap[match[2].toLowerCase()],
+		year: parseInt(match[3], 10),
+	};
+}
+
+function buildIsoFromLocal(dateInfo, timeText) {
+	const parts = timeText.split(":");
+	const hour = parseInt(parts[0], 10);
+	const minute = parseInt(parts[1], 10);
+	const date = new Date(dateInfo.year, dateInfo.month - 1, dateInfo.day, hour, minute, 0, 0);
+	return formatLocalIso(date);
+}
+
+function formatLocalIso(date) {
+	const y = date.getFullYear();
+	const m = String(date.getMonth() + 1).padStart(2, "0");
+	const d = String(date.getDate()).padStart(2, "0");
+	const hh = String(date.getHours()).padStart(2, "0");
+	const mm = String(date.getMinutes()).padStart(2, "0");
+	const ss = String(date.getSeconds()).padStart(2, "0");
+	const offsetMinutes = -date.getTimezoneOffset();
+	const sign = offsetMinutes >= 0 ? "+" : "-";
+	const absOffset = Math.abs(offsetMinutes);
+	const offHours = String(Math.floor(absOffset / 60)).padStart(2, "0");
+	const offMinutes = String(absOffset % 60).padStart(2, "0");
+	return `${y}-${m}-${d}T${hh}:${mm}:${ss}${sign}${offHours}:${offMinutes}`;
+}
+
+function stripAirportCode(label) {
+	return String(label || "").replace(/\s*\([A-Z]{3}\)\s*$/, "").trim();
+}
+
+function extractPassengerNames(lines) {
+	const passengers = [];
+	const startIndex = lines.findIndex(line => /passagier\(s\)/i.test(line));
+	if (startIndex === -1) return passengers;
+
+	for (let i = startIndex + 5; i + 3 &lt; lines.length; i += 4) {
+		const firstName = lines[i];
+		const lastName = lines[i + 1];
+		const ageCategory = lines[i + 2];
+		if (!firstName || !lastName || !ageCategory) break;
+		if (!/volwassene|kind|baby/i.test(ageCategory)) break;
+		passengers.push(`${firstName} ${lastName}`.trim());
+	}
+
+	return passengers;
+}
+
+function extractBookingReference(text) {
+	const match = String(text || "").match(/(?:bestelnummer|ordernummer)\s+([0-9\-]+)/i);
+	return match ? match[1] : "";
+}
+
+function buildFlightNotes(mailText, segment) {
+	const parts = [
+		"Flight booking confirmation email.",
+		`Route: ${segment.fromLabel} to ${segment.toLabel}.`,
+	];
+	if (segment.bookingRef) parts.push(`Booking reference: ${segment.bookingRef}.`);
+	if (segment.passengers &amp;&amp; segment.passengers.length > 0) {
+		parts.push(`Passengers: ${segment.passengers.join(", ")}.`);
+	}
+	return parts.join(" ");
+}
+
+function extractJsonPayload(rawText) {
+	let text = String(rawText || "").trim();
+	if (!text) throw new Error("LLM returned empty response.");
+
+	text = stripCodeFences(text);
+	text = stripReasoningPreamble(text);
+
+	const directCandidate = balancedJsonPrefix(text);
+	if (directCandidate) return directCandidate;
+
+	const embeddedCandidate = firstBalancedJsonBlock(text);
+	if (embeddedCandidate) return embeddedCandidate;
+
+	throw new Error("No JSON object or array found in LLM response.");
+}
+
+function stripCodeFences(text) {
+	const fenced = text.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/i);
+	return fenced ? fenced[1].trim() : text;
+}
+
+function stripReasoningPreamble(text) {
+	let cleaned = text;
+	const channelIndex = cleaned.lastIndexOf("&lt;|message|&gt;");
+	if (channelIndex !== -1) {
+		cleaned = cleaned.slice(channelIndex + "&lt;|message|&gt;".length).trim();
+	}
+
+	const candidates = [cleaned.indexOf("{"), cleaned.indexOf("[")].filter(i => i >= 0);
+	if (candidates.length === 0) return cleaned;
+
+	const firstJsonIndex = Math.min.apply(null, candidates);
+	return cleaned.slice(firstJsonIndex).trim();
+}
+
+function balancedJsonPrefix(text) {
+	const trimmed = String(text || "").trim();
+	if (!trimmed) return "";
+	const first = trimmed[0];
+	if (first !== "{" &amp;&amp; first !== "[") return "";
+	return findBalancedJsonAt(trimmed, 0);
+}
+
+function firstBalancedJsonBlock(text) {
+	const source = String(text || "");
+	for (let i = 0; i &lt; source.length; i++) {
+		const char = source[i];
+		if (char !== "{" &amp;&amp; char !== "[") continue;
+		const candidate = findBalancedJsonAt(source, i);
+		if (candidate) return candidate;
+	}
+	return "";
+}
+
+function findBalancedJsonAt(text, startIndex) {
+	const startChar = text[startIndex];
+	const endChar = startChar === "{" ? "}" : "]";
+	let depth = 0;
+	let inString = false;
+	let escaping = false;
+
+	for (let i = startIndex; i &lt; text.length; i++) {
+		const char = text[i];
+
+		if (escaping) {
+			escaping = false;
+			continue;
+		}
+
+		if (char === "\\") {
+			if (inString) escaping = true;
+			continue;
+		}
+
+		if (char === '"') {
+			inString = !inString;
+			continue;
+		}
+
+		if (inString) continue;
+
+		if (char === startChar) depth++;
+		else if (char === endChar) depth--;
+
+		if (depth === 0) {
+			return text.slice(startIndex, i + 1).trim();
+		}
+	}
+
+	return "";
 }
 
 function createIcsAndHandle(events, allowRetry) {

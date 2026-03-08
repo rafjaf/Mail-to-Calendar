@@ -8,6 +8,7 @@ This Automator service extracts calendar events from the most recent email of th
 
 - Extracts event fields: title, start, end, timezone, location, notes, attendees, confidence.
 - Accepts LLM responses that are a single JSON object or an array of events.
+- Recovers when a model wraps the JSON in code fences, reasoning tags, or extra explanatory text, as long as a complete JSON object or array is present in the response.
 - Automatically defaults end time when missing (configurable duration).
 - Generates a temporary `.ics` file and shows a readable preview dialog with buttons: OK / Edit / Cancel.
   - OK: opens the .ics in Calendar (you choose the calendar and confirm creation).
@@ -58,7 +59,8 @@ This Automator service extracts calendar events from the most recent email of th
 - Calendar write errors
   - Some calendars (subscribed or read-only) reject scripted event creation; the workflow avoids this by producing an `.ics` for you to import manually via Calendar.
 - LLM responses
-  - The LLM must return valid JSON. If parsing fails, the raw LLM output is saved to the log for inspection.
+  - The workflow asks for a single JSON object for one event, or a JSON array when the email clearly contains multiple separate events.
+  - The parser will strip common wrapper text before decoding JSON. If parsing still fails, the raw LLM output is saved to the log for inspection.
 - Editing the workflow
   - Edit `Contents/document.wflow` using Automator or a text editor to modify behavior. Be careful to keep XML-sensitive characters escaped when editing the embedded JavaScript source.
 
