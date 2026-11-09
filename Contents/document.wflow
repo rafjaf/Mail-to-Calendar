@@ -73,10 +73,13 @@ const CONFIG = {
   // MLX LM Server (OpenAI-compatible API, e.g. mlx_lm.server --port 11434)
   mlxUrl: "http://localhost:32000/v1/chat/completions",
   mlxModel: "mlx-community/gpt-oss-20b-MXFP4-Q8", // ← change to your loaded model name
+  mlxMaxTokens: 4096, // shared budget for reasoning and final JSON
+  mlxRetryMaxTokens: 8192, // one local retry if the initial budget is exhausted
+  mlxReasoningEffort: "low", // passed through MLX to the model chat template
 
   // OpenAI
   openaiUrl: "https://api.openai.com/v1/chat/completions",
-  openaiModel: "gpt-5-mini",
+  openaiModel: "gpt-5.4-mini",
   openaiApiKey: "", // leave blank to read from Keychain (recommended)
 	openaiKeychainService: "openai-API-token",
 	openaiKeychainAccount: ObjC.unwrap($.NSProcessInfo.processInfo.environment.objectForKey('USER')) || "default",
@@ -102,17 +105,25 @@ function run() {
 		let eventsToCreate = [];
 
 		while (true) {
-			llmJsonText = (providerUsed === "ollama")
-				? callOllama(prompt)
-				: (providerUsed === "mlx")
-				? callMLX(prompt)
-				: callOpenAI(prompt);
+			llmJsonText = "";
+			try {
+				llmJsonText = (providerUsed === "ollama")
+					? callOllama(prompt)
+					: (providerUsed === "mlx")
+					? callMLX(prompt)
+					: callOpenAI(prompt);
+			} catch (requestError) {
+				logToFile(logPath, buildLogPayload({ error: requestError, mailText, prompt, llmJsonText }));
+				if (!shouldRetryWithOpenAI(providerUsed, requestError, "The local model request failed.")) throw requestError;
+				providerUsed = "openai";
+				continue;
+			}
 
 			try {
 				eventsToCreate = parseEventsFromLlm(llmJsonText, app);
 			} catch (parseError) {
 				eventsToCreate = extractEventsFromMailHeuristics(mailText, app);
-				if (eventsToCreate.length === 0 &amp;&amp; shouldRetryParseFailureWithOpenAI(providerUsed, parseError)) {
+				if (eventsToCreate.length === 0 &amp;&amp; shouldRetryWithOpenAI(providerUsed, parseError, "The local model returned invalid calendar data.")) {
 					providerUsed = "openai";
 					continue;
 				}
@@ -122,7 +133,7 @@ function run() {
 				throw new Error("No valid events detected (missing title or start). See log for LLM output.");
 			}
 
-			const action = createIcsAndHandle(eventsToCreate, providerUsed === "ollama" || providerUsed === "mlx");
+			const action = createIcsAndHandle(eventsToCreate, providerUsed === "ollama" || providerUsed === "mlx", providerUsed);
 			if (action === "retry-openai") {
 				providerUsed = "openai";
 				continue;
@@ -144,12 +155,12 @@ function run() {
 	}
 }
 
-function shouldRetryParseFailureWithOpenAI(providerUsed, error) {
+function shouldRetryWithOpenAI(providerUsed, error, reason) {
 	if (providerUsed !== "ollama" &amp;&amp; providerUsed !== "mlx") return false;
 
 	const message = truncatePreview(String(error || "Unknown parsing error."));
 	const retryChoice = safeDisplayDialog(
-		"The local model returned invalid calendar data.\n\n" + message + "\n\nRetry analysis with ChatGPT?",
+		reason + "\n\n" + message + "\n\nRetry analysis with ChatGPT? This sends the selected email to OpenAI.",
 		{
 			withTitle: "Mail to Calendar",
 			buttons: ["Cancel", "Retry with ChatGPT"],
@@ -289,7 +300,7 @@ function callOllama(promptText) {
   return (resp &amp;&amp; resp.message &amp;&amp; resp.message.content) ? String(resp.message.content) : "";
 }
 
-function callMLX(promptText) {
+function callMLX(promptText, maxTokens = CONFIG.mlxMaxTokens) {
   // mlx_lm.server exposes an OpenAI-compatible API at /v1/chat/completions.
   // It does NOT accept a leading "system" role — roles must alternate user/assistant.
   // We prepend the system instruction directly into the user message instead.
@@ -301,10 +312,19 @@ function callMLX(promptText) {
     ],
 		stream: false,
     temperature: 0.1,
-		max_tokens: 1000,
+		max_tokens: maxTokens,
+    chat_template_kwargs: { reasoning_effort: CONFIG.mlxReasoningEffort },
   };
-  const resp = httpPostJson(CONFIG.mlxUrl, payload, {});
-  const content = resp &amp;&amp; resp.choices &amp;&amp; resp.choices[0] &amp;&amp; resp.choices[0].message &amp;&amp; resp.choices[0].message.content;
+  const resp = httpPostJson(CONFIG.mlxUrl, payload, {}, maxTokens > CONFIG.mlxMaxTokens ? 360 : 180);
+  const choice = resp &amp;&amp; resp.choices &amp;&amp; resp.choices[0];
+  if (choice &amp;&amp; choice.finish_reason === "length") {
+    if (maxTokens &lt; CONFIG.mlxRetryMaxTokens) return callMLX(promptText, CONFIG.mlxRetryMaxTokens);
+    const usedTokens = resp.usage &amp;&amp; resp.usage.completion_tokens;
+    throw new Error("MLX output was truncated at the generation limit (" +
+      (usedTokens || maxTokens) + " tokens, including reasoning). " +
+      "Increase CONFIG.mlxRetryMaxTokens or reduce reasoning effort. See log: " + defaultLogPath());
+  }
+  const content = choice &amp;&amp; choice.message &amp;&amp; choice.message.content;
   if (!content) {
     if (resp &amp;&amp; resp.error) throw new Error("MLX API error: " + JSON.stringify(resp.error));
     throw new Error("MLX returned empty content. Full response logged to: " + defaultLogPath());
@@ -338,7 +358,7 @@ function callOpenAI(promptText) {
 	return String(content);
 }
 
-function httpPostJson(url, payloadObj, extraHeaders) {
+function httpPostJson(url, payloadObj, extraHeaders, timeoutSeconds = 180) {
   const app = Application.currentApplication();
   app.includeStandardAdditions = true;
 
@@ -347,26 +367,48 @@ function httpPostJson(url, payloadObj, extraHeaders) {
   const headerArgs = Object.entries(extraHeaders || {}).flatMap(([k, v]) =&gt; ["-H", `${k}: ${v}`]);
 
   const cmd = [
-    "/usr/bin/curl", "-s",
+    "/usr/bin/curl", "--silent", "--show-error",
+    "--connect-timeout", "10", "--max-time", String(timeoutSeconds),
     "-H", "Content-Type: application/json",
     ...headerArgs,
-    "-d", payloadStr,
+    "--data-binary", payloadStr,
+    "--write-out", "\n%{http_code}",
     url,
   ];
 
-  const out = app.doShellScript(cmd.map(shellEscape).join(" "));
-
-  // Debug: always log the raw HTTP response so we can inspect what the server returns
+  let out;
   try {
-    const _dbgPath = defaultLogPath();
-    logToFile(_dbgPath, JSON.stringify({
+    // Include curl's stderr so connection failures survive the JXA bridge.
+    out = app.doShellScript(cmd.map(shellEscape).join(" ") + " 2>&amp;1", { alteringLineEndings: false });
+  } catch (e) {
+    throw new Error("Request to " + url + " failed. " + String(e));
+  }
+
+  const statusIndex = out.lastIndexOf("\n");
+  const status = Number(out.slice(statusIndex + 1));
+  const body = out.slice(0, statusIndex);
+
+  let response;
+  try { response = JSON.parse(body); } catch (_parseErr) {}
+  try {
+    const choice = response &amp;&amp; response.choices &amp;&amp; response.choices[0];
+    logToFile(defaultLogPath(), JSON.stringify({
       debug_url: url,
-      debug_status: out.slice(0, 120),
-      debug_raw_response: out.slice(0, 8000),
+      debug_model: payloadObj.model,
+      debug_max_tokens: payloadObj.max_tokens || payloadObj.max_completion_tokens,
+      debug_finish_reason: choice ? choice.finish_reason : null,
+      debug_usage: response ? response.usage : null,
+      http_status: status,
+      debug_status: body.slice(0, 120),
+      debug_raw_response: body.slice(0, 8000),
     }, null, 2));
   } catch (_dbgErr) {}
 
-  try { return JSON.parse(out); } catch (e) { throw new Error("Non-JSON HTTP response:\n" + out); }
+  if (status &lt; 200 || status >= 300 || !Number.isFinite(status)) {
+    throw new Error("HTTP " + status + " from " + url + ":\n" + body.slice(0, 2000));
+  }
+  if (response === undefined) throw new Error("Non-JSON HTTP response from " + url + ":\n" + body.slice(0, 2000));
+  return response;
 }
 
 function readKeychain(service, account) {
@@ -675,7 +717,7 @@ function findBalancedJsonAt(text, startIndex) {
 	return "";
 }
 
-function createIcsAndHandle(events, allowRetry) {
+function createIcsAndHandle(events, allowRetry, providerUsed) {
 	const app = Application.currentApplication();
 	app.includeStandardAdditions = true;
 
@@ -684,7 +726,7 @@ function createIcsAndHandle(events, allowRetry) {
 
 	app.doShellScript(`printf %s ${shellEscape(icsContent)} > ${shellEscape(path)}`);
 
-	const preview = buildHumanPreview(events);
+	const preview = buildHumanPreview(events, providerUsed);
 	const choice = safeDisplayDialog(preview, {
 		withTitle: "Mail to Calendar",
 		buttons: ["Cancel", "Edit", "OK"],
@@ -729,8 +771,10 @@ function safeDisplayDialog(text, options) {
 	}
 }
 
-function buildHumanPreview(events) {
-	const parts = ["Draft calendar event(s):", ""];
+function buildHumanPreview(events, providerUsed) {
+	const models = { mlx: CONFIG.mlxModel, ollama: CONFIG.ollamaModel, openai: CONFIG.openaiModel };
+	const providers = { mlx: "MLX", ollama: "Ollama", openai: "OpenAI" };
+	const parts = ["Draft calendar event(s):", `Model: ${models[providerUsed]} (${providers[providerUsed]})`, ""];
 	for (const ev of events) {
 		const start = new Date(ev.startISO);
 		const end = new Date(ev.endISO);
@@ -846,9 +890,10 @@ function defaultLogPath() {
 }
 
 function buildLogPayload({ error, mailText, prompt, llmJsonText }) {
-	const errText = (error &amp;&amp; error.stack) ? String(error.stack) : String(error);
 	return JSON.stringify({
-		error: errText,
+		error: String(error),
+		stack: (error &amp;&amp; error.stack) ? String(error.stack) : "",
+		errorNumber: (error &amp;&amp; error.errorNumber !== undefined) ? error.errorNumber : null,
 		mailText: mailText || "",
 		prompt: prompt || "",
 		llmJsonText: llmJsonText || "",
